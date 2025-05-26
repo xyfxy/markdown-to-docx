@@ -93,41 +93,63 @@ def markdown_to_docx_cli(input_md: str, output_docx: str,
         # Process elements with special handling for title and recipient
         title_found = False
         recipient_processed = False
+        current_paragraph_obj = None # For merging paragraph and inline_code
         
         for i, element in enumerate(parsed_elements):
             el_type = element.get('type')
-            el_text = element.get('text', '')
-            logger.debug(f"Processing element {i+1}/{len(parsed_elements)}: type='{el_type}', text='{el_text[:30]}...'")
+            el_text = element.get('text', '') # Default for elements that have text
+            logger.debug(f"Processing element {i+1}/{len(parsed_elements)}: type='{el_type}', content='{str(element)[:100]}...'")
 
             if el_type in ['h1', 'h2', 'h3', 'h4', 'h5']:
                 level_num = int(el_type[1:])
                 writer.add_heading(el_text, level=level_num)
-                # Mark title as found for H1
                 if level_num == 1:
                     title_found = True
                     logger.debug(f"Processed main title: '{el_text}'")
+                current_paragraph_obj = None # Reset for block elements
             elif el_type == 'paragraph':
-                # Check if this should be treated as recipient (first paragraph after H1 title)
+                # Check if this should be treated as recipient
                 if title_found and not recipient_processed:
-                    # This is the first paragraph after title, treat as recipient
                     logger.debug(f"Attempting to add recipient: '{el_text}'")
-                    writer.add_recipient(el_text)
+                    current_paragraph_obj = writer.add_recipient(el_text) # add_recipient also returns a paragraph obj
                     logger.info(f"Processed paragraph after title as recipient: '{el_text}'")
                     recipient_processed = True
+                    # Recipient is a special block, subsequent inline code shouldn't merge with it.
+                    # However, if add_recipient itself creates a full paragraph, then current_paragraph_obj is fine.
+                    # For safety, and assuming recipient is a standalone block:
+                    # current_paragraph_obj = None # Uncomment if recipient should not be merged with subsequent inline_code
                 else:
-                    writer.add_paragraph(el_text)
+                    logger.debug(f"Adding paragraph: '{el_text[:50]}...'")
+                    current_paragraph_obj = writer.add_paragraph(el_text)
+            elif el_type == 'inline_code':
+                logger.debug(f"Adding inline_code: '{el_text}'")
+                if current_paragraph_obj is None:
+                    # Create a new paragraph if inline_code is not preceded by a paragraph element
+                    # This handles cases where inline_code might appear after a heading, list, or at the start.
+                    # According to PRD, inline code should be part of a paragraph.
+                    # If md_parser ensures inline_code is always within a conceptual paragraph (even if not explicit <p>),
+                    # this new paragraph creation might be for standalone inline code snippets.
+                    # For now, we'll create a new paragraph if there isn't an active one.
+                    logger.debug("No active paragraph for inline_code, creating a new one.")
+                    current_paragraph_obj = writer.document.add_paragraph()
+                     # Remove default first line indent for paragraphs created just for inline code
+                    current_paragraph_obj.paragraph_format.first_line_indent = None
+                writer.add_inline_code(el_text, current_paragraph_obj)
             elif el_type == 'emphasis':
+                # Emphasis creates its own paragraph as per current docx_generator.py
+                logger.debug(f"Adding emphasis: '{el_text}', style: {element.get('style')}")
                 writer.add_emphasis(el_text, style=element.get('style', 'italic'))
-            elif el_type == 'ul_start':
-                current_list_type_stack.append('ul')
+                current_paragraph_obj = None # Reset for block elements
+            elif el_type == 'ul_start' or el_type == 'ol_start':
+                logger.debug(f"Starting list: {el_type}")
+                current_list_type_stack.append('ul' if el_type == 'ul_start' else 'ol')
                 list_level_counters[len(current_list_type_stack) - 1] = 0 
-            elif el_type == 'ol_start':
-                current_list_type_stack.append('ol')
-                list_level_counters[len(current_list_type_stack) - 1] = 0
+                current_paragraph_obj = None # Reset for block elements
             elif el_type == 'list_item':
                 if not current_list_type_stack:
                     logger.warning(f"Encountered list_item '{el_text}' without active list context. Skipping.")
                     click.secho(f"Warning: List item '{el_text[:30]}...' found out of list context. Skipping.", fg="yellow")
+                    current_paragraph_obj = None # Reset for safety
                     continue
                 current_level = element.get('level', len(current_list_type_stack) - 1)
                 is_ordered = current_list_type_stack[current_level] == 'ol'
@@ -137,13 +159,52 @@ def markdown_to_docx_cli(input_md: str, output_docx: str,
                     prefix = ORDERED_LIST_PREFIX_FORMAT.format(list_level_counters[current_level])
                 else:
                     prefix = UNORDERED_LIST_BULLETS[current_level % len(UNORDERED_LIST_BULLETS)]
+                logger.debug(f"Adding list_item: '{el_text[:30]}...', prefix: '{prefix}', level: {current_level}")
                 writer.add_list_item(el_text, ordered=is_ordered, level=current_level, item_prefix=prefix)
+                current_paragraph_obj = None # List items are block-like, reset current paragraph
             elif el_type == 'ul_end' or el_type == 'ol_end':
+                logger.debug(f"Ending list: {el_type}")
                 if current_list_type_stack:
                     current_list_type_stack.pop()
                 else:
                     logger.warning(f"Encountered {el_type} without active list context. Ignoring.")
                     click.secho(f"Warning: {el_type} found out of list context. Ignoring.", fg="yellow")
+                current_paragraph_obj = None # Reset for block elements
+            # --- New Element Handling ---
+            elif el_type == 'table':
+                table_data = element # The whole element is the table data structure from md_parser
+                logger.info(f"Adding table: {len(table_data.get('headers',[]))} header(s), {len(table_data.get('rows',[]))} row(s)")
+                writer.add_table(table_data)
+                current_paragraph_obj = None 
+            elif el_type == 'code_block':
+                logger.info(f"Adding code_block (lang: {element.get('language')}): {el_text[:50]}...")
+                writer.add_code_block(el_text, element.get('language'))
+                current_paragraph_obj = None
+            elif el_type == 'blockquote':
+                logger.info(f"Adding blockquote: {el_text[:50]}...")
+                writer.add_blockquote(el_text)
+                current_paragraph_obj = None
+            elif el_type == 'link':
+                logger.info(f"Adding link: Text='{el_text}', URL='{element.get('href')}'")
+                writer.add_hyperlink_paragraph(el_text, element.get('href'))
+                current_paragraph_obj = None
+            elif el_type == 'image':
+                src = element.get('src')
+                alt = element.get('alt')
+                logger.info(f"Adding image: src='{src}', alt='{alt}'")
+                # Using a default width for images as discussed, e.g., 15cm.
+                # This can be made configurable if needed.
+                writer.add_image(src, alt, width_cm=15.0) 
+                current_paragraph_obj = None
+            elif el_type == 'horizontal_rule':
+                logger.info("Adding horizontal_rule.")
+                writer.add_horizontal_rule()
+                current_paragraph_obj = None
+            # --- End of New Element Handling ---
+            else:
+                logger.warning(f"Unknown element type encountered: '{el_type}'. Content: '{str(element)[:100]}'. Skipping.")
+                click.secho(f"Warning: Unknown element type '{el_type}'. Skipping.", fg="yellow")
+                current_paragraph_obj = None # Reset for unknown elements too
 
         logger.info("Saving the document...")
         writer.save()

@@ -12,12 +12,16 @@ class MarkdownElementExtractor(HTMLParser):
         self.current_tag = None
         self.current_text = ""
         self.list_stack = []  # Stack to keep track of 'ol' or 'ul' context
-        self.active_emphasis_tags = [] # To handle nested emphasis
+        self.active_emphasis_tags = []  # To handle nested emphasis
+        self.table_data = None  # To store current table data (structured approach)
+        self.current_row = None # To store current row data within a table
+        self.in_code_block = False # Flag to differentiate between inline code and block code
 
     def handle_starttag(self, tag, attrs):
         self.current_tag = tag
+        attributes = dict(attrs)
 
-        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p']:
+        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'blockquote', 'th', 'td']:
             self.current_text = ""
         elif tag == 'ul':
             self.list_stack.append('ul')
@@ -31,6 +35,39 @@ class MarkdownElementExtractor(HTMLParser):
             self.is_ordered_list_item = bool(self.list_stack and self.list_stack[-1] == 'ol')
             # Level for the list item itself
             self.current_li_level = len(self.list_stack) -1 if self.list_stack else 0
+        elif tag == 'pre':
+            self.in_code_block = True
+            self.current_text = "" # Reset for capturing code content
+            lang = ""
+            if 'class' in attributes:
+                lang_class = attributes['class']
+                if lang_class.startswith('language-'):
+                    lang = lang_class.split('language-')[1]
+            # Store language temporarily, will be used in handle_endtag for <code>
+            self.code_block_language = lang 
+        elif tag == 'code':
+            # If not inside <pre>, it's inline code.
+            # If inside <pre>, text will be captured by <pre>'s handler or directly.
+            if not self.in_code_block:
+                self.current_text = ""
+        elif tag == 'hr':
+            self.structured_elements.append({'type': 'horizontal_rule'})
+            self.current_text = "" # hr has no content
+        elif tag == 'a':
+            self.current_href = attributes.get('href', '')
+            self.current_text = "" # For link text
+        elif tag == 'img':
+            src = attributes.get('src', '')
+            alt = attributes.get('alt', '')
+            self.structured_elements.append({'type': 'image', 'src': src, 'alt': alt})
+            self.current_text = "" # img handled, no text content to accumulate for img itself
+        elif tag == 'table':
+            self.table_data = {'type': 'table', 'headers': [], 'rows': []}
+            self.current_text = ""
+        elif tag == 'tr':
+            self.current_row = [] # Initialize a new row
+            self.current_text = ""
+        # th, td, blockquote will reset self.current_text as per the first condition in this method.
         elif tag in ['strong', 'em']:
             self.active_emphasis_tags.append(tag)
             self.current_text = "" # Reset for capturing only emphasized text
@@ -42,69 +79,97 @@ class MarkdownElementExtractor(HTMLParser):
             if text_content:
                 self.structured_elements.append({'type': tag, 'text': text_content})
         elif tag == 'p':
+            # Revised logic for paragraphs to avoid duplication with emphasis/links if they are sole content
             if text_content:
-                # Avoid adding paragraphs that are empty or only contained already processed emphasis.
-                is_redundant_paragraph = False
+                # Check if the paragraph solely wraps an element already processed
+                # (e.g. <p><a>link</a></p> or <p><em>text</em></p>)
+                # This is a heuristic. A more robust way would be to check child elements,
+                # but parser doesn't directly expose parent-child relations post-factum easily.
+                is_wrapper = False
                 if self.structured_elements:
                     last_el = self.structured_elements[-1]
-                    # Check if the last element was emphasis AND this paragraph text is identical
-                    # AND this paragraph is not part of a list item (where P tags are common)
-                    if last_el['type'] == 'emphasis' and last_el['text'] == text_content:
-                         # This heuristic could be improved by checking if the <p> tag was an immediate child of <body> or <li>
-                         # For now, this simplification might lead to some desired <p> tags being omitted if they only contain emphasis.
-                         # A more robust check would involve knowing the parent of 'p'.
-                         # For the current PRD, emphasis creates its own paragraph in docx.
-                         pass # Let add_emphasis in DocxWriter handle paragraphs for emphasis.
-
-                # If the paragraph is not solely for an emphasis element that's already captured:
-                if not is_redundant_paragraph: # This logic might need refinement.
-                    # A simple check: if the last element is emphasis and text matches,
-                    # we assume this p-tag was just a wrapper for it.
-                    # This avoids double entries when markdown does <p><em>text</em></p>.
-                    # However, if emphasis is handled by creating its own paragraph in DocxWriter,
-                    # then we should be careful not to add this <p> if it only contained that emphasis.
-
-                    # Revised logic: if the paragraph only contained an emphasis tag,
-                    # and that emphasis element was the last thing added, skip this paragraph.
-                    if self.structured_elements and \
-                       self.structured_elements[-1]['type'] == 'emphasis' and \
-                       self.structured_elements[-1]['text'] == text_content and \
+                    if last_el['text'] == text_content and \
+                       (last_el['type'] == 'emphasis' or last_el['type'] == 'link' or last_el['type'] == 'inline_code') and \
                        not self.list_stack: # Only apply this rule if not inside a list
-                        pass # Assume emphasis already handled
-                    elif text_content: # Add if there's text and it's not a duplicate emphasis wrapper
-                        self.structured_elements.append({'type': 'paragraph', 'text': text_content})
-
+                        is_wrapper = True
+                
+                if not is_wrapper:
+                    self.structured_elements.append({'type': 'paragraph', 'text': text_content})
 
         elif tag == 'li':
-            if text_content: # Nested tags like <strong> or <em> within <li> might be processed before <li> text.
+            if text_content:
                 self.structured_elements.append({
                     'type': 'list_item',
                     'text': text_content,
                     'ordered': self.is_ordered_list_item,
                     'level': self.current_li_level
                 })
-            # If an li tag is empty but contains sub-lists, it might be missed.
-            # Markdown usually ensures `<li>` has some text or a nested list which itself has text.
-            # An empty `<li></li>` would correctly add no text.
 
         elif tag == 'ul':
-            if self.list_stack and self.list_stack[-1] == 'ul': # Ensure matching tag
+            if self.list_stack and self.list_stack[-1] == 'ul':
                 level = len(self.list_stack) - 1
                 self.list_stack.pop()
                 self.structured_elements.append({'type': 'ul_end', 'level': level})
         elif tag == 'ol':
-            if self.list_stack and self.list_stack[-1] == 'ol': # Ensure matching tag
+            if self.list_stack and self.list_stack[-1] == 'ol':
                 level = len(self.list_stack) - 1
                 self.list_stack.pop()
                 self.structured_elements.append({'type': 'ol_end', 'level': level})
-
-        elif tag in ['strong', 'em'] and self.active_emphasis_tags:
-            active_tag = self.active_emphasis_tags.pop() # Pop the corresponding opening tag
+        elif tag == 'strong' or tag == 'em':
+            if self.active_emphasis_tags: # Ensure there's an active tag to pop
+                active_tag = self.active_emphasis_tags.pop()
+                # Ensure the closing tag matches the last opened emphasis tag for correctness,
+                # though HTMLParser usually handles mismatched tags by closing them implicitly.
+                if active_tag == tag and text_content:
+                    style = 'bold' if active_tag == 'strong' else 'italic'
+                    self.structured_elements.append({'type': 'emphasis', 'text': text_content, 'style': style})
+        elif tag == 'pre':
+            # Code content is actually inside the 'code' tag within 'pre'
+            # This will be handled by 'code' tag's endtag logic when self.in_code_block is true
+            self.in_code_block = False 
+            self.code_block_language = None # Reset language
+        elif tag == 'code':
+            if self.in_code_block: # This 'code' tag is part of a 'pre' block
+                lang = getattr(self, 'code_block_language', '') # Get language stored from <pre>
+                self.structured_elements.append({'type': 'code_block', 'text': text_content, 'language': lang})
+            else: # Inline code
+                if text_content:
+                    self.structured_elements.append({'type': 'inline_code', 'text': text_content})
+        elif tag == 'blockquote':
             if text_content:
-                style = 'bold' if active_tag == 'strong' else 'italic'
-                self.structured_elements.append({'type': 'emphasis', 'text': text_content, 'style': style})
+                self.structured_elements.append({'type': 'blockquote', 'text': text_content})
+        elif tag == 'a':
+            if text_content or self.current_href: # Add link if there's text or an href
+                self.structured_elements.append({'type': 'link', 'text': text_content, 'href': self.current_href})
+            self.current_href = None
+        elif tag == 'table':
+            if self.table_data:
+                self.structured_elements.append(self.table_data)
+            self.table_data = None
+        elif tag == 'tr':
+            if self.table_data is not None and self.current_row is not None:
+                # Determine if this row should be in headers or rows based on content
+                is_header_row = all(cell.get('is_header') for cell in self.current_row)
+                if is_header_row and not self.table_data['headers']: # Add to headers if empty and cells are th
+                     self.table_data['headers'].append(self.current_row)
+                else: # Otherwise, add to data rows
+                    # If it was parsed as a header row but headers are already populated, make it a data row
+                    # This handles cases like <thead><tr><th>...</th></tr></thead><tbody><tr><th>... (mistake)
+                    # For simplicity, we are not strictly parsing thead/tbody, but inferring from th/td content of rows.
+                    # A more robust parser might use thead/tbody explicitly.
+                    if is_header_row and self.table_data['headers']:
+                         for cell in self.current_row: cell['is_header'] = False
+                    self.table_data['rows'].append(self.current_row)
+            self.current_row = None
+        elif tag == 'th':
+            if self.current_row is not None and text_content:
+                self.current_row.append({'text': text_content, 'is_header': True})
+        elif tag == 'td':
+            if self.current_row is not None and text_content:
+                self.current_row.append({'text': text_content, 'is_header': False})
+        # hr, img are handled in starttag as they don't have end tags in the same way or content.
 
-        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'strong', 'em']:
+        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'strong', 'em', 'pre', 'code', 'blockquote', 'a', 'th', 'td']:
              self.current_text = "" # Reset text after processing relevant elements
         
         self.current_tag = None
@@ -112,7 +177,11 @@ class MarkdownElementExtractor(HTMLParser):
 
     def handle_data(self, data):
         # Accumulate text if we are inside a relevant tag or active emphasis
-        if self.current_tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li'] or self.active_emphasis_tags:
+        # Added 'blockquote', 'th', 'td', 'a'. For 'code', depends on context (in_code_block or not)
+        if self.current_tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'blockquote', 'th', 'td', 'a'] \
+           or self.active_emphasis_tags \
+           or (self.current_tag == 'code' and not self.in_code_block) \
+           or (self.in_code_block and self.current_tag == 'code'): # Capture text for code inside pre
             self.current_text += data
 
     def get_structured_data(self):
@@ -149,6 +218,15 @@ def parse_markdown(markdown_file_path: str) -> list:
     # ]
     # This might be too aggressive if empty paragraphs are sometimes intentional.
     # For now, keep all paragraphs and let DocxWriter handle them.
+
+    # Post-processing to refine table structure:
+    # If a table has multiple lists in 'headers', it means multiple <tr> in <thead>
+    # We'll keep it as a list of header rows.
+    # Same for 'rows' if there are multiple <tr> in <tbody>
+    
+    # Example of further refinement if needed (e.g. ensuring cells are uniform per row, etc.)
+    # For now, the structure is a list of header rows, and a list of data rows.
+    # Each row is a list of cell dictionaries.
 
     return structured_data
 
