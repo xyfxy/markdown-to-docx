@@ -90,16 +90,10 @@ def markdown_to_docx_cli(input_md: str, output_docx: str,
         list_level_counters: Dict[int, int] = {} 
         current_list_type_stack: List[str] = [] 
 
-        # Heuristic for recipient
-        if parsed_elements and parsed_elements[0]['type'] == 'paragraph':
-            first_p_text = parsed_elements[0]['text']
-            if first_p_text.endswith("：") or first_p_text.endswith(":"):
-                recipient_text = first_p_text[:-1] 
-                logger.debug(f"Attempting to add recipient: '{recipient_text}'")
-                writer.add_recipient(recipient_text)
-                logger.info(f"Processed first paragraph as recipient: '{recipient_text}'")
-                parsed_elements = parsed_elements[1:]
-
+        # Process elements with special handling for title and recipient
+        title_found = False
+        recipient_processed = False
+        
         for i, element in enumerate(parsed_elements):
             el_type = element.get('type')
             el_text = element.get('text', '')
@@ -108,8 +102,20 @@ def markdown_to_docx_cli(input_md: str, output_docx: str,
             if el_type in ['h1', 'h2', 'h3', 'h4', 'h5']:
                 level_num = int(el_type[1:])
                 writer.add_heading(el_text, level=level_num)
+                # Mark title as found for H1
+                if level_num == 1:
+                    title_found = True
+                    logger.debug(f"Processed main title: '{el_text}'")
             elif el_type == 'paragraph':
-                writer.add_paragraph(el_text)
+                # Check if this should be treated as recipient (first paragraph after H1 title)
+                if title_found and not recipient_processed:
+                    # This is the first paragraph after title, treat as recipient
+                    logger.debug(f"Attempting to add recipient: '{el_text}'")
+                    writer.add_recipient(el_text)
+                    logger.info(f"Processed paragraph after title as recipient: '{el_text}'")
+                    recipient_processed = True
+                else:
+                    writer.add_paragraph(el_text)
             elif el_type == 'emphasis':
                 writer.add_emphasis(el_text, style=element.get('style', 'italic'))
             elif el_type == 'ul_start':
@@ -182,4 +188,3 @@ def markdown_to_docx_cli(input_md: str, output_docx: str,
 
 if __name__ == '__main__':
     markdown_to_docx_cli()
-```
